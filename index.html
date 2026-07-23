@@ -532,6 +532,11 @@
     return window.SpeechRecognition || window.webkitSpeechRecognition || null;
   }
 
+  let recognitionActive = false;   // true between onstart and onend
+  let restartTimeoutId = null;
+  let watchdogInterval = null;
+  let lastResultAt = 0;
+
   function initRecognition(){
     const Ctor = getRecognitionCtor();
     if(!Ctor){
@@ -542,8 +547,23 @@
     r.lang = 'ko-KR';
     r.continuous = true;
     r.interimResults = true;
+    r.maxAlternatives = 1;
+
+    r.onstart = ()=>{
+      recognitionActive = true;
+      if(isRecording) transcriptStatus.textContent = '듣는 중';
+    };
+
+    r.onspeechstart = ()=>{
+      if(isRecording) transcriptStatus.textContent = '음성 인식 중';
+    };
+
+    r.onspeechend = ()=>{
+      if(isRecording) transcriptStatus.textContent = '듣는 중 (대기)';
+    };
 
     r.onresult = (event)=>{
+      lastResultAt = Date.now();
       let interim = '';
       for(let i = event.resultIndex; i < event.results.length; i++){
         const res = event.results[i];
@@ -562,23 +582,62 @@
     };
 
     r.onerror = (e)=>{
-      if(e.error === 'no-speech') return;
+      if(e.error === 'no-speech' || e.error === 'aborted'){
+        // benign: engine paused on silence or we intentionally stopped it
+        return;
+      }
       if(e.error === 'not-allowed' || e.error === 'service-not-allowed'){
         toast('마이크 권한이 필요합니다.');
         stopRecording();
+        return;
+      }
+      if(e.error === 'network'){
+        console.warn('SpeechRecognition network hiccup, will auto-retry');
         return;
       }
       console.error('SpeechRecognition error:', e.error);
     };
 
     r.onend = ()=>{
-      // auto-restart while user still intends to record (browser stops after ~silence in some cases)
+      recognitionActive = false;
+      // Chrome frequently ends the recognizer on its own (after a pause,
+      // ~60s of continuous audio, etc). If the user still wants to record,
+      // restart it right away so nothing is missed.
       if(isRecording){
-        try{ r.start(); }catch(err){ /* already started */ }
+        transcriptStatus.textContent = '다시 연결 중…';
+        scheduleRestart(150);
       }
     };
 
     return r;
+  }
+
+  function scheduleRestart(delay){
+    clearTimeout(restartTimeoutId);
+    restartTimeoutId = setTimeout(()=>{
+      if(!isRecording || !recognition) return;
+      if(recognitionActive) return; // already running
+      try{
+        recognition.start();
+      }catch(err){
+        // "already started" race — back off and try again shortly
+        scheduleRestart(300);
+      }
+    }, delay);
+  }
+
+  function startWatchdog(){
+    lastResultAt = Date.now();
+    watchdogInterval = setInterval(()=>{
+      if(!isRecording) return;
+      // If recognition silently died (no onend fired, but not active either), force a restart.
+      if(!recognitionActive){
+        scheduleRestart(50);
+      }
+    }, 4000);
+  }
+  function stopWatchdog(){
+    clearInterval(watchdogInterval);
   }
 
   let interimLineEl = null;
@@ -661,12 +720,19 @@
     recognition = initRecognition();
     if(!recognition) return;
     isRecording = true;
+    recognitionActive = false;
     recBtn.classList.add('recording');
     recBtnLabel.textContent = '녹음 중지';
-    transcriptStatus.textContent = '녹음 중';
+    transcriptStatus.textContent = '연결 중…';
     startTimer();
     startWaveform();
-    try{ recognition.start(); }catch(e){ console.warn(e); }
+    startWatchdog();
+    try{
+      recognition.start();
+    }catch(e){
+      console.warn('initial start failed, retrying', e);
+      scheduleRestart(300);
+    }
     restartAutoOrganizeTimer();
   }
 
@@ -677,9 +743,12 @@
     transcriptStatus.textContent = '대기 중';
     stopTimer();
     stopWaveform();
+    stopWatchdog();
+    clearTimeout(restartTimeoutId);
     if(recognition){
       try{ recognition.onend = null; recognition.stop(); }catch(e){}
     }
+    recognitionActive = false;
     clearInterval(organizeTimer);
     // final organize pass on stop, if there's unprocessed content
     if(sinceLastOrganize.trim()){
