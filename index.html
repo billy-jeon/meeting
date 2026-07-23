@@ -333,6 +333,13 @@
   .send-btn{background:var(--teal); color:#fff;}
   .send-btn:disabled, .save-btn:disabled{opacity:0.45; cursor:not-allowed;}
   .save-btn{background:var(--ink); color:var(--paper-raised);}
+  .audio-status{
+    flex:0 0 auto;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11px;
+    color:var(--muted);
+    white-space:nowrap;
+  }
 
   ::-webkit-scrollbar{width:8px;}
   ::-webkit-scrollbar-thumb{background:var(--hairline); border-radius:4px;}
@@ -440,7 +447,9 @@
 
 <footer>
   <input type="text" id="promptInput" placeholder="예: 3번째 항목을 더 구체적으로 다시 써줘 / 결정사항만 따로 모아줘">
+  <span class="audio-status" id="audioStatus"></span>
   <button class="send-btn" id="reviseBtn">수정 반영</button>
+  <button class="save-btn" id="saveAudioBtn" disabled>오디오 원본 저장</button>
   <button class="save-btn" id="saveBtn">.txt로 저장</button>
 </footer>
 
@@ -475,6 +484,8 @@
   const promptInput = document.getElementById('promptInput');
   const reviseBtn = document.getElementById('reviseBtn');
   const saveBtn = document.getElementById('saveBtn');
+  const saveAudioBtn = document.getElementById('saveAudioBtn');
+  const audioStatusEl = document.getElementById('audioStatus');
   const settingsBtn = document.getElementById('settingsBtn');
   const settingsPopover = document.getElementById('settingsPopover');
   const closePopoverBtn = document.getElementById('closePopoverBtn');
@@ -671,16 +682,69 @@
     transcriptBody.scrollTop = transcriptBody.scrollHeight;
   }
 
-  // ---------- Waveform (mic level visual) ----------
+  // ---------- Waveform + parallel audio capture (Phase 2) ----------
+  // We capture raw audio alongside the live Web Speech transcript so that,
+  // in a later phase, it can be sent to a speaker-diarization model
+  // (e.g. gpt-4o-transcribe-diarize) for an accurate, speaker-labeled pass.
+  let mediaRecorder = null;
+  let audioChunks = [];
+  let recordingMimeType = '';
+  let audioSecondsAtStart = 0;
+
+  function pickSupportedMimeType(){
+    const candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/mp4'
+    ];
+    for(const c of candidates){
+      if(window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)){
+        return c;
+      }
+    }
+    return ''; // let the browser pick a default
+  }
+
   async function startWaveform(){
     try{
       micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // --- waveform visual (existing) ---
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const source = audioCtx.createMediaStreamSource(micStream);
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 64;
       source.connect(analyser);
       drawWave();
+
+      // --- parallel raw audio recording (new) ---
+      audioChunks = [];
+      recordingMimeType = pickSupportedMimeType();
+      if(window.MediaRecorder){
+        try{
+          mediaRecorder = recordingMimeType
+            ? new MediaRecorder(micStream, { mimeType: recordingMimeType })
+            : new MediaRecorder(micStream);
+          mediaRecorder.ondataavailable = (e)=>{
+            if(e.data && e.data.size > 0){
+              audioChunks.push(e.data);
+              updateAudioStatus();
+            }
+          };
+          mediaRecorder.onerror = (e)=> console.error('MediaRecorder error', e.error || e);
+          // 10s timeslice: periodic flush so we don't lose everything if the
+          // tab crashes, without fragmenting the recording (chunks from one
+          // continuous MediaRecorder instance concatenate back into a valid file).
+          mediaRecorder.start(10000);
+          audioSecondsAtStart = secondsElapsed;
+          updateAudioStatus();
+        }catch(err){
+          console.error('MediaRecorder init failed', err);
+          mediaRecorder = null;
+          toast('오디오 원본 녹음은 이 브라우저에서 지원되지 않아, 실시간 스크립트만 기록됩니다.');
+        }
+      }
     }catch(err){
       console.error('mic access error', err);
       toast('마이크에 접근할 수 없습니다. 권한을 확인해 주세요.');
@@ -707,8 +771,29 @@
   function stopWaveform(){
     if(waveAnimId) cancelAnimationFrame(waveAnimId);
     waveCtx.clearRect(0,0,waveformCanvas.width, waveformCanvas.height);
+    if(mediaRecorder && mediaRecorder.state !== 'inactive'){
+      try{ mediaRecorder.stop(); }catch(e){ console.warn(e); }
+    }
     if(micStream){ micStream.getTracks().forEach(t=>t.stop()); micStream = null; }
     if(audioCtx){ audioCtx.close(); audioCtx = null; }
+    updateAudioStatus();
+  }
+
+  function getAudioBlob(){
+    if(!audioChunks.length) return null;
+    return new Blob(audioChunks, { type: recordingMimeType || 'audio/webm' });
+  }
+
+  function updateAudioStatus(){
+    const blob = getAudioBlob();
+    if(blob){
+      const mb = (blob.size / (1024*1024)).toFixed(1);
+      audioStatusEl.textContent = `오디오 원본 ${mb}MB 확보됨`;
+      saveAudioBtn.disabled = false;
+    } else {
+      audioStatusEl.textContent = '';
+      saveAudioBtn.disabled = true;
+    }
   }
 
   // ---------- Recording control ----------
@@ -892,6 +977,24 @@
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     toast('저장했습니다: ' + fname);
+  });
+
+  saveAudioBtn.addEventListener('click', ()=>{
+    const blob = getAudioBlob();
+    if(!blob){ toast('저장할 오디오가 없습니다.'); return; }
+    const now = new Date();
+    const pad = n => n.toString().padStart(2,'0');
+    const ext = (recordingMimeType.includes('ogg')) ? 'ogg' : (recordingMimeType.includes('mp4') ? 'm4a' : 'webm');
+    const fname = `회의녹음_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}.${ext}`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('오디오 원본을 저장했습니다: ' + fname);
   });
 
   // Warn upfront if browser doesn't support speech recognition
